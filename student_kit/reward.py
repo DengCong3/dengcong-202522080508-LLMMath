@@ -67,15 +67,19 @@ def _extract_svg(text: str) -> tuple[str, bool, dict[str, Any]]:
         text = re.sub(r"^```.*\n", "", text)
         text = re.sub(r"```$", "", text).strip()
 
-    m = re.search(r"<svg\b[^>]*>.*?</svg>", text, re.DOTALL | re.IGNORECASE)
-    if not m:
+    # require exactly one top-level <svg>...</svg> and nothing meaningful after it
+    matches = list(re.finditer(r"<svg\b[^>]*>.*?</svg>", text, re.DOTALL | re.IGNORECASE))
+    if not matches:
         return "", False, details
 
-    svg = m.group(0)
+    svg = matches[0].group(0)
     details["has_svg"] = True
+    details["svg_count"] = len(matches)
     details["has_code_fence"] = has_code_fence
-    details["extra_text_before"] = bool(text[: m.start()].strip())
-    details["extra_text_after"] = bool(text[m.end():].strip())
+    details["extra_text_before"] = bool(text[: matches[0].start()].strip())
+    trailing = text[matches[0].end():].strip()
+    details["extra_text_after"] = bool(trailing)
+    details["trailing_text"] = trailing[:200]
     return svg, True, details
 
 
@@ -85,6 +89,22 @@ def _has_viewbox(svg: str) -> bool:
 
 def _has_xmlns(svg: str) -> bool:
     return bool(re.search(r"xmlns\s*=\s*['\"]http://www\.w3\.org/2000/svg['\"]", svg, re.IGNORECASE))
+
+
+def _malformed_penalty(svg: str) -> float:
+    penalty = 0.0
+    # illegal fragments/tokens that show the model is hallucinating XML/HTML
+    bad = ["<eos>", "<|eot_id|>", "<|end_of_text|>", "<core", "<tropical", "<coral"]
+    penalty += sum(0.1 for token in bad if token in svg)
+    # malformed gradient refs / URLs / attributes
+    if "url(#" in svg:
+        penalty += 0.1
+    if "fill-alpha=" in svg or 'runat="black"' in svg or 'stroke-turned=' in svg:
+        penalty += 0.1
+    # obviously non-SVG closing tags
+    if re.search(r"</(?!svg|g|defs|path|circle|rect|ellipse|polygon|line|linearGradient|radialGradient|stop|clipPath|mask)[a-zA-Z]+>", svg):
+        penalty += 0.15
+    return min(0.5, penalty)
 
 
 def _count_tags(svg: str, tag: str) -> int:

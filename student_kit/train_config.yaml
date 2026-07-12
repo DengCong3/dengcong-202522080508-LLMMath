@@ -1,10 +1,10 @@
-# LoRA training config for Gemma 3 270M (transformers + PEFT + QLoRA)
+# LoRA training config for Gemma 3 270M (transformers + PEFT + QLoRA/BF16 LoRA)
 model_dir: ./gemma3-270m
 train_file: ./dataset/logo-detailed-prompt/train.jsonl
 valid_file: ./dataset/logo-detailed-prompt/valid.jsonl
 output_dir: ./adapter
 
-max_seq_length: 768
+max_seq_length: 1024
 per_device_train_batch_size: 2
 per_device_eval_batch_size: 2
 gradient_accumulation_steps: 8
@@ -20,10 +20,16 @@ save_steps: 200
 eval_steps: 200
 seed: 42
 bf16: true
-gradient_checkpointing: true
-optim: paged_adamw_8bit
+gradient_checkpointing: false
+optim: adamw_torch
 lr_scheduler_type: cosine
 evaluation_strategy: steps
 save_total_limit: 3
 report_to: none
 push_to_hub: false
+load_best_model_at_end: true
+metric_for_best_model: eval_loss
+greater_is_better: false
+group_by_length: true
+max_grad_norm: 1.0
+early_stopping_patience: 5

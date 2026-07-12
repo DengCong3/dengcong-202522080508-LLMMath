@@ -305,7 +305,9 @@ ALL DONE!
 ➜  svg_logo_task git:(master) ✗ python student_kit/eval_self.py \
   --model_dir ./gemma3-270m \
   --adapter_dir ./adapter \
-  --valid_file ./dataset/logo-detailed-prompt/valid.jsonl
+  --valid_file ./dataset/logo-detailed-prompt/valid.jsonl \
+  --output ./results.json \
+  --max_new_tokens 1024
 ============================================================
 ENVIRONMENT CHECK (eval_self)
   torch          : 2.6.0+cu126 (CUDA: 12.6)
@@ -320,18 +322,48 @@ Loaded 17 validation examples
 Evaluating BASE model
 ==================================================
 [transformers] `torch_dtype` is deprecated! Use `dtype` instead!
-Loading weights: 100%|███████████████████████████████████████████████████████████████| 236/236 [00:00<00:00, 1818.30it/s]
-Generating: 100%|████████████████████████████████████████████████████████████████████████| 17/17 [04:55<00:00, 17.40s/it]
+Loading weights: 100%|███████████████████| 236/236 [00:00<00:00, 1513.43it/s]
+Generating: 100%|████████████████████████████| 17/17 [10:21<00:00, 36.56s/it]
 ==================================================
 Evaluating FINE-TUNED model
 ==================================================
-Loading weights: 100%|███████████████████████████████████████████████████████████████| 236/236 [00:00<00:00, 1333.82it/s]
+Loading weights: 100%|███████████████████| 236/236 [00:00<00:00, 1341.33it/s]
   Loaded with PeftModel (PEFT)
-Generating: 100%|████████████████████████████████████████████████████████████████████████| 17/17 [08:13<00:00, 29.02s/it]
+Generating: 100%|████████████████████████████| 17/17 [12:24<00:00, 43.78s/it]
 
-Results saved to student_kit/results.json
+Results saved to results.json
 
-Base     reward: 0.2650
-Finetune reward: 0.2650
-Delta:          +0.0000
-➜  svg_logo_task git:(master) ✗ 
+Base     reward: 0.1844
+Finetune reward: 0.5559
+Delta:          +0.3715
+
+============================================================
+EVALUATION SUMMARY
+============================================================
+Metric                         Base   Finetune      Delta
+------------------------------------------------------------
+Mean Reward                  0.1844     0.5559    +0.3715
+Valid Rate                   0.0000     0.8235    +0.8235
+valid_structure              0.0000     0.8235    +0.8235
+clean_extraction             0.4529     0.8235    +0.3706
+length                       0.0971     0.8235    +0.7265
+palette                      0.0000     0.8235    +0.8235
+coordinates                  0.6471     0.6905    +0.0434
+prompt_coverage              0.0000     0.0235    +0.0235
+element_diversity            0.0000     0.8235    +0.8235
+smoothness                   0.6471     0.0407    -0.6064
+============================================================
+Best / Worst samples by reward delta
+============================================================
+TOP1 idx=10 delta=+0.6929
+  prompt: Center a thin perfect circle outline in soft cream as a quiet backdrop halo, giving the mark a bouti...
+  base:   You are a professional graphic designer who is looking for a new challenge. You have a strong portfolio and are ready to...
+  finetune: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><defs><radialGradient id="haloGrad" cx="50%" cy="50%" r="5...
+TOP2 idx=1 delta=+0.6864
+  prompt: A soft circular badge in pale gray-blue (#E8ECEF) sits centered as the base, giving the mark a stabl...
+  base:   You are a professional illustrator who creates high-quality vector illustrations for a variety of projects. You have exp...
+  finetune: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><rect x="-9999" y="-9999" width="19998" height="19998" fil...
+TOP3 idx=16 delta=+0.6756
+  prompt: A soft circular badge sits at the back as a pale sage-green disc, grounding the mark with a sense of...
+  base:   You are a professional graphic designer who has designed logos, banners, and other visual elements for various clients. ...
+  finetune: <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256"><rect x="-98" y="-98" width="196" height="196" fill="#FBF7...

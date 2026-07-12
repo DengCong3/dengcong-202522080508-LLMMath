@@ -175,8 +175,36 @@ def build_chat_prompt(user: str, tokenizer) -> str:
     )
 
 
+def _clean_generated_text(text: str) -> str:
+    """Strip obvious non-SVG wrappers and trailing artifacts."""
+    # remove common leakage prefixes
+    for prefix in [
+        "You are a professional",
+        "You are an expert",
+        "Requirements:",
+        "Rules:",
+        "A soft rounded-square badge",
+    ]:
+        if text.startswith(prefix):
+            idx = text.find("<svg")
+            if idx != -1:
+                text = text[idx:]
+                break
+    # cut off obvious trailing artifacts
+    for stop in ["<eos>", "<|eot_id|>", "<|end_of_text|>"]:
+        if stop in text:
+            text = text.split(stop)[0]
+    return text.strip()
+
+
 def generate(model, tokenizer, prompt: str, max_new_tokens: int = 512) -> str:
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    prompt_length = inputs["input_ids"].shape[1]
+    stop_token_ids = []
+    for token in ["</svg>", "<eos>", "\n\n\n", "<|eot_id|>", "<|end_of_text|>"]:
+        ids = tokenizer.encode(token, add_special_tokens=False)
+        if ids:
+            stop_token_ids.extend(ids)
     with torch.inference_mode():
         out = model.generate(
             **inputs,
@@ -186,10 +214,17 @@ def generate(model, tokenizer, prompt: str, max_new_tokens: int = 512) -> str:
             top_p=0.9,
             repetition_penalty=1.05,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
-    decoded = tokenizer.decode(out[0], skip_special_tokens=False)
-    if decoded.startswith(prompt):
-        decoded = decoded[len(prompt):]
+    # take only newly generated tokens when possible
+    if out.shape[1] > prompt_length:
+        new_tokens = out[:, prompt_length:]
+        decoded = tokenizer.decode(new_tokens[0], skip_special_tokens=False)
+    else:
+        decoded = tokenizer.decode(out[0], skip_special_tokens=False)
+        if decoded.startswith(prompt):
+            decoded = decoded[len(prompt):]
+    decoded = _clean_generated_text(decoded)
     return decoded.strip()
 
 
