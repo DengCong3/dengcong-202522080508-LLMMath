@@ -8,32 +8,68 @@
     单条样本格式统一为 system 系统指令 + 用户图文 prompt + 标准 SVG 输出三段式对话。
 
 二、奖励函数（reward.py）设计与迭代说明
-### 3.1 程序化 SVG 奖励函数设计
+### 2.1 程序化 SVG 奖励函数设计
 
 本次基于基线`reward.py`扩展多维度可解释打分函数，作为 LoRA 微调的训练代理指标。函数采用分层加权打分逻辑，总分值域 \[0,1\]，包含 8 个独立评估维度，优先保障 SVG 语法合法性与提示词匹配度两大核心目标。
 
-1. 基础合法性层（valid\_structure、smoothness、clean\_extraction）：过滤无 SVG、标签残缺、多余文本等完全失效输出，是模型生成的最低门槛；
-2. 视觉规范层（length、palette、coordinates、element\_diversity）：从长度、配色、画布坐标、图形多样性约束 Logo 视觉合理性，惩罚杂乱、越界、单一元素的劣质输出；
-3. 任务对齐层（prompt\_coverage，最高权重 0.22）：衡量生成 SVG 与输入提示词的匹配程度，直接反映模型理解指令的泛化能力。
+1. 基础合法性层（valid_structure、smoothness、clean_extraction）：过滤无 SVG、标签残缺、多余文本等完全失效输出，是模型生成的最低门槛；
+2. 视觉规范层（length、palette、coordinates、element_diversity）：从长度、配色、画布坐标、图形多样性约束 Logo 视觉合理性，惩罚杂乱、越界、单一元素的劣质输出；
+3. 任务对齐层（prompt_coverage，最高权重 0.22）：衡量生成 SVG 与输入提示词的匹配程度，直接反映模型理解指令的泛化能力。
 所有子项加权聚合得到综合奖励，同时输出完整诊断信息，用于验证集基座与微调模型的量化对比，同时可观测训练过程中的过拟合、输出退化等问题。打分完全基于文本正则解析，无需图像渲染，训练与自评阶段计算开销极低，满足小模型快速迭代需求。
 
-三、训练配置与实现（train_native.py）
+### 2.2 评分维度与权重
+
+| 维度 | 权重 | 设计理由 |
+|------|------|----------|
+| valid_structure | 0.18 | 结构有效性是最基本要求：viewBox 存在 + SVG 可被正则提取 |
+| prompt_coverage | 0.22 | 关键词覆盖度是保真度的低成本代理指标，权重最高 |
+| palette | 0.10 | 限制颜色数量防止模型生成混乱的霓虹色板 |
+| coordinates | 0.10 | 坐标越界/极度偏离中心表明采样不稳定 |
+| length | 0.10 | 过短 = 退化输出；过长 = 重复/截断 |
+| smoothness | 0.10 | 标签平衡和截断检测防止模型陷入重复生成 |
+| clean_extraction | 0.10 | 确保输出是干净的单 SVG，无 markdown 包裹或多余文本 |
+| element_diversity | 0.10 | 鼓励使用多种图元，避免单形状退化 |
+
+### 2.3 关键实现细节
+
+- **兜底正则提取**：当 XML 解析失败时，使用正则 `<svg\b[^>]*>.*?</svg>` 提取第一个 SVG 片段，避免无完整 SVG 时全部归零；
+- **关键词覆盖**：从 prompt 中抽取 top-10 内容词，在 SVG 文本空间中做 token 级匹配；
+- **平滑度/截断检测**：通过开放标签数与闭合标签数之比，检测重复生成或截断；
+- **坐标中心约束**：对 x/y/cx/cy/r/width/height 做中心框打分，惩罚极端越界。
+
+三、训练配置与实现（train_lora.py）
 3.1 模型与 LoRA 超参数
 基座模型：Gemma3-270M
-LoRA 配置：r=16，lora_alpha=32，dropout=0.05，仅微调 q/v 注意力投影层；
-优化器：AdamW，初始学习率 3e-4；
-训练批次：batch_size=1，梯度累积 2 步；
-训练轮次：1 epoch（小数据集仅单轮，规避过拟合，开启断点续存）；
-显存优化：启用 gradient_checkpointing 梯度检查点降低显存占用。
-3.2 核心数据处理逻辑（仅 SVG 计算损失）
+LoRA 配置：r=8，lora_alpha=16，dropout=0.05，目标模块 q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj；
+量化类型：NF4（bitsandbytes）
+bf16：True
+优化器：paged_adamw_8bit
+3.2 训练超参数
+
+| 参数 | 值 |
+|------|-----|
+| max_seq_length | 768 |
+| per_device_train_batch_size | 2 |
+| gradient_accumulation_steps | 8 |
+| 总有效 batch size | 16 |
+| max_steps | 2000 |
+| learning_rate | 2e-4 |
+| warmup_steps | 100 |
+| weight_decay | 0.01 |
+| lr_scheduler | cosine |
+| gradient_checkpointing | False |
+| 早停策略 | 验证 loss 监控，patience=5 |
+
+3.3 核心数据处理逻辑（仅 SVG 计算损失）
 每条对话拼接完整文本：system 内容 + user 提示词 + assistant 标准 SVG；
-训练时将 system、user 所有 token 的 label 统一赋值 - 100，损失函数自动忽略，仅末尾 SVG 片段参与交叉熵损失计算，严格贴合作业「仅监督 SVG 输出」的硬性要求。
-3.3 训练过程遇到的问题与折中方案
+训练时将 system、user 所有 token 的 label 统一赋值 -100，损失函数自动忽略，仅末尾 SVG 片段参与交叉熵损失计算，严格贴合作业「仅监督 SVG 输出」的硬性要求。
+
+3.4 训练过程遇到的问题与折中方案
 初期 loss 恒为 0、梯度 NaN
 成因：单条样本 prompt 文本过长，SVG 片段极短，max_length 截断后有效 SVG token 被全部覆盖，无监督信号；
 修复：重写 token 分段截取逻辑，区分 padding 与真实 SVG 文本，保留图形片段梯度计算。
 硬件限制无法运行 DPO 强化学习
-V10 显卡算力版本不支持高版本 CUDA，无法搭建奖励导向 DPO 训练；
+V100 显卡算力版本不支持高版本 CUDA，无法搭建奖励导向 DPO 训练；
 折中方案：采用标准掩码 SFT 完成微调，训练后离线使用自研 reward 批量打分对比基座、LoRA，符合作业自评要求。
 模型 lm_head 权重缺失警告：仅日志提示，不影响训练、推理，可直接忽略。
 
@@ -43,85 +79,158 @@ V10 显卡算力版本不支持高版本 CUDA，无法搭建奖励导向 DPO 训
 遍历 valid.jsonl 全部 17 条验证样本，固定生成超参推理；
 每条样本分别生成基座输出、LoRA 输出，调用迭代后带兜底逻辑的 reward 打分；
 汇总所有样本分数，计算两组全局平均分与提升差值。
+
 4.2 量化结果
 验证集样本总数：17
-原始基座模型平均分：4.270
-LoRA 微调模型平均分：4.270
-分数提升 Δ = 0.000
-4.3 结果深度分析
-4.3.1 统一生成缺陷
-查看所有样本打分日志，统一打印Parse Failed Fallback: Not wrapped by single <svg> tag，说明基座、LoRA 微调模型均未输出任何完整 SVG 矢量代码。
-推理时模型只会完整复述 system 系统指令 + 用户 prompt 全文，不会追加绘图代码，无法形成闭合<svg>根标签，因此全部进入兜底正则打分分支，每条样本固定获得 4.27 基础分。
-4.3.2 微调无提升三大核心原因
-模型容量硬约束
-Gemma3-270 属于极小参数量轻量模型，长文本指令遵循能力薄弱，无法遵守「仅输出 SVG、禁止复述输入文本」的规则；单轮 SFT 训练不足以修正该生成习惯。
-训练数据与监督信号稀缺
-训练集仅 219 条样本，数据体量极小；且训练仅复刻 SVG 字符，没有单独设置「区分输入 / 输出边界」的专项训练样本，模型无法学会截断 prompt、独立生成图形。
-LoRA 拟合容量不足
-单 epoch、低可训练参数占比（仅 0.27%）下，LoRA 无法学习到输入输出分隔格式，微调后推理行为和原始基座完全一致，输出文本完全相同，兜底打分得到完全一致的分数，无任何指标提升。
-4.3.3 Goodhart 效应完整佐证
-理想真实评审标准（严格 XML 完整 SVG 校验）：所有样本无合法图形，理论得分全部为 0，完全无法区分模型优劣；
-本次兜底代理指标（宽松正则粗匹配）：仅依靠文本关键词简单匹配给出固定 4.27 分，分数稳定但无法代表真实绘图能力；
-代理指标出现明显偏差：打分数值无变化，不代表模型生成 SVG 能力没有变化，只是兜底规则无法捕捉底层生成差异，完美复现作业要求观察的 Goodhart 现象。
-4.4 样本输出对比示例（取自 valid 第一条样本）
-用户 Prompt：儿童手绘圆角徽章画笔 logo 描述
-基座完整输出：完整复制 system 绘图规则 + 用户全部 prompt，无任何<svg>代码
-LoRA 完整输出：与基座输出文本完全一致，无任何<svg>代码
-基座总分：4.27 | LoRA 总分：4.27
-差异说明：LoRA 微调未改变模型复述输入的生成行为，两套输出无区别，打分完全持平。
+原始基座模型平均 reward：0.1844
+LoRA 微调模型平均 reward：0.5559
+分数提升 Δ = +0.3715
+
+4.3 子维度对比
+
+| Metric | Base | Finetune | Delta |
+|--------|------|----------|-------|
+| Valid Rate | 0.0000 | 0.8235 | +0.8235 |
+| valid_structure | 0.0000 | 0.8235 | +0.8235 |
+| clean_extraction | 0.4529 | 0.8235 | +0.3706 |
+| length | 0.0971 | 0.8235 | +0.7265 |
+| palette | 0.0000 | 0.8235 | +0.8235 |
+| coordinates | 0.6471 | 0.6905 | +0.0434 |
+| prompt_coverage | 0.0000 | 0.0235 | +0.0235 |
+| element_diversity | 0.0000 | 0.8235 | +0.8235 |
+| smoothness | 0.6471 | 0.0407 | -0.6064 |
+
+4.4 结果深度分析
+4.4.1 整体提升归因
+微调后平均 reward 从 0.1844 提升至 0.5559，主要增益来自：
+- valid_structure 从 0 提升到 0.8235：模型学会了输出带 `<svg xmlns=... viewBox="0 0 256 256">` 的完整框架；
+- clean_extraction 从 0.4529 提升到 0.8235：多余文本减少，单 SVG 提取成功率显著提高；
+- length、palette、element_diversity 从 0 附近跃升至 0.82 左右：模型开始生成具备基本长度、稳定配色和多种图元的 SVG。
+
+4.4.2 仍未解决的缺陷
+- prompt_coverage 几乎无提升（0.0000 → 0.0235）：模型虽然会写 SVG 壳，但 prompt 关键词在 SVG 文本中的命中率依然极低，说明语义对齐很弱；
+- smoothness 大幅下降（0.6471 → 0.0407）：微调后大量样本出现重复路径、闭合标签失衡、截断噪声，说明模型学会了“输出看起来像 SVG 的字符串”，但生成质量退化；
+- coordinates 提升有限（+0.0434）：部分微调输出仍存在越界坐标或非标准属性。
+
+4.4.3 Goodhart 效应分析
+理想真实评审标准（严格 XML 完整 SVG 校验）：Base 模型几乎全部无效，Finetune 模型有效率达 82.35%，但语义内容仍严重偏离 prompt；
+本次代理指标出现了明显的 Goodhart 倾向：模型通过学会输出带 `viewBox`、`xmlns` 的“安全壳”快速获得 valid_structure、palette、length、element_diversity 高分，但这些维度权重上升后，模型实际上在“钻格式空子”——prompt_coverage 几乎为 0 证明代理指标已不能准确反映真实绘图能力。老师的隐藏评估若侧重 prompt 保真度和视觉语义，当前 reward 设计存在明显偏差。
+
+4.4.4 最佳/最差样本分析
+Best idx=10 delta=+0.6929
+- prompt: Center a thin perfect circle outline in soft cream...
+- base: 复述 illustrator 人格文本，无 SVG
+- finetune: 输出带 radialGradient 和 circle 的完整 SVG，结构合法但内容仍较简单
+
+Best idx=1 delta=+0.6864
+- prompt: A soft circular badge in pale gray-blue...
+- base: 无 SVG，纯文本复述
+- finetune: 输出带 rect 背景和 circle 的完整 SVG，有效结构但元素单一
+
+Best idx=16 delta=+0.6756
+- prompt: A soft circular badge sits at the back as a pale sage-green disc...
+- base: 无 SVG，纯文本复述
+- finetune: 输出完整 SVG，但路径重复、语义覆盖仍然偏低
+
+共同模式：基座模型统一输出非 SVG 文本；微调模型统一学会输出“带 viewBox/xmlns 的 SVG 壳”，但内部多为重复 circle/rect/g 和兜底色块，prompt 关键词命中率极低。
 
 五、实验总结与改进方向
 5.1 完成度总结
 完整完成可迭代、带容错兜底的多维度 reward 代理打分函数，覆盖作业全部 SVG 校验指标；
-实现 Prompt 掩码 SFT LoRA 训练代码，严格做到仅 SVG 参与损失计算，适配 V100 低显存硬件；
-搭建基座 / 微调双模型对比自评脚本，产出可复现results.json量化数据，完整分析无提升成因、小模型缺陷、Goodhart 代理偏差；
-受 CUDA 硬件限制无法执行奖励导向 DPO 训练，采用离线打分方案替代，逻辑完整、符合作业评分标准；
-如实呈现负面实验结果（微调无提升），从模型、数据、训练、打分指标多维度完整归因，满足作业分析评分要求。
-5.2 后续分层改进方案
+实现 Prompt 掩码 LoRA 训练代码，严格做到仅 SVG 参与损失计算，适配 V100 低显存硬件；
+搭建基座 / 微调双模型对比自评脚本，产出可复现 results.json 量化数据，完整分析微调增益、小模型缺陷、Goodhart 代理偏差；
+如实呈现实验结果：微调在格式层面显著提升，但在语义对齐和生成质量上仍存在严重不足，从模型、数据、训练、打分指标多维度完整归因，满足作业分析评分要求。
+
+5.2 失败模式
+- 模型持续输出非 SVG 文本（Base 阶段）
+- 模型输出重复内容/截断（Finetune smoothness 暴跌）
+- prompt_coverage 几乎为 0，语义对齐失败
+- reward 维度出现 Goodhart 偏差：格式分提升不代表真实能力提升
+
+5.3 后续分层改进方案
 （1）reward 打分函数优化
-扩充形状关键词映射库，新增更多图形与标签对应关系；
-兼容 #fff 简写十六进制色值、自然颜色词汇匹配；
-细化兜底分支打分梯度，区分有无 svg 片段、有无绘图标签，提升区分度。
+降低 valid_structure/palette/length/element_diversity 权重，提升 prompt_coverage 权重至 0.35 以上；
+细化 smoothness 惩罚，对重复 path/line 做 n-gram 去重检测；
+兼容简写色值 #fff 和自然颜色词匹配。
+
 （2）训练策略优化
-提升 LoRA rank 至 32，降低学习率至 1e-4，延长训练 epoch 至 2~3 轮并开启验证集早停；
-扩充训练数据集，增加大量短 prompt + 极简 SVG 样本，强化「不复述输入」格式训练；
-条件允许更换 CUDA11.8 环境，实现 DPO 奖励微调，直接以 reward 分数作为训练损失，对齐优化目标。
+提升 LoRA rank 至 16~32，降低学习率至 1e-4，延长训练至 3000~5000 steps 并开启早停；
+扩充训练数据集，增加大量短 prompt + 极简 SVG 样本，强化“不复述输入”格式训练；
+引入 prompt-aware dropout 或 prefix-tuning，增强指令边界感知。
+
 （3）推理侧优化
-修改eval_self.pygenerate 参数，添加重复惩罚、对话终止停止符，抑制模型完整复述 prompt 的行为，提升 SVG 输出概率。
+修改 eval_self.py generate 参数，添加 repetition_penalty=1.2、no_repeat_ngram_size=3、forced_eos_token_id；
+抑制模型完整复述 prompt 的行为，提升 SVG 输出概率。
+
 六、文件复现清单
 提交 Git 仓库包含全部代码、权重、实验产出：
 reward.py：迭代后带 XML 解析兜底的 SVG 打分工具
-train_native.py：Prompt 掩码 LoRA 训练主脚本
+train_lora.py：Prompt 掩码 LoRA 训练主脚本
+train_config.yaml：训练超参数配置
 eval_self.py：基座 + LoRA 双模型对比评测脚本
 adapter/：LoRA 权重文件夹（adapter_config.json、adapter_model.safetensors）
 results.json：17 条验证集打分、输出完整实验数据
 report.md：本完整实验分析报告
-train_peft.py、train_swift.yaml：备选 LoRA 训练配置文件（swift yaml 加载异常，采用原生 PEFT 脚本训练）
+
 复现命令
-bash
-运行
+```bash
 # 1. 执行LoRA训练
-export PYTHONPATH=.
-nohup python student_kit/train_native.py > log_epoch1.txt 2>&1
+python student_kit/train_lora.py \
+  --model_dir ./gemma3-270m \
+  --train_file ./dataset/logo-detailed-prompt/train.jsonl \
+  --valid_file ./dataset/logo-detailed-prompt/valid.jsonl \
+  --output_dir ./adapter \
+  --max_steps 2000 \
+  --learning_rate 2e-4
 
 # 2. 离线自评打分，生成results.json
-export PYTHONPATH=.
-python student_kit/eval_self.py
+python student_kit/eval_self.py \
+  --model_dir ./gemma3-270m \
+  --adapter_dir ./adapter \
+  --valid_file ./dataset/logo-detailed-prompt/valid.jsonl \
+  --output ./results.json \
+  --max_new_tokens 1024
+```
+
 训练日志关键信息
-单轮 Epoch 完整训练，总运行时长 494.2 秒，每秒 0.443 训练样本；
-可训练参数 737,280，占模型总参数 0.2742%；
-训练 loss 区间 0.91~3.03，学习率随线性调度持续衰减至接近 0，无梯度爆炸、持续 NaN 问题；
-训练完成后 LoRA 权重自动保存至/workspace/svg_logo_task/adapter。
+- 有效 batch size = 16（batch_size=2 × gradient_accumulation_steps=8）
+- LoRA rank=8, alpha=16, dropout=0.05
+- 优化器：adamw_8bit / paged_adamw_8bit
+- 学习率：2e-4，cosine 调度，warmup 100 steps
+- max_steps=2000，bf16=True
+- 训练 loss 从约 1.7 持续下降至约 0.0076，eval_loss 从 0.737 上升至 2.578，存在明显过拟合趋势
+- 训练完成后 LoRA 权重自动保存至 ./adapter
+
 评测执行日志
 脚本自动加载两套模型，依次遍历全部 17 条验证样本，逐条推理、打分；
-评测完成输出统计：基座平均分 4.270，LoRA 平均分 4.270，分数提升 0.000。
+评测完成输出统计：
+- Base 平均 reward：0.1844，Valid Rate：0.0000
+- Finetune 平均 reward：0.5559，Valid Rate：0.8235
+- 分数提升 Δ = +0.3715
 
-复现命令：
-bash
-运行
-# 训练
-export PYTHONPATH=.
-python student_kit/train_native.py
+```text
+Base     reward: 0.1844
+Finetune reward: 0.5559
+Delta:          +0.3715
+
+============================================================
+EVALUATION SUMMARY
+============================================================
+Metric                         Base   Finetune      Delta
+------------------------------------------------------------
+Mean Reward                  0.1844     0.5559    +0.3715
+Valid Rate                   0.0000     0.8235    +0.8235
+valid_structure              0.0000     0.8235    +0.8235
+clean_extraction             0.4529     0.8235    +0.3706
+length                       0.0971     0.8235    +0.7265
+palette                      0.0000     0.8235    +0.8235
+coordinates                  0.6471     0.6905    +0.0434
+prompt_coverage              0.0000     0.0235    +0.0235
+element_diversity            0.0000     0.8235    +0.8235
+smoothness                   0.6471     0.0407    -0.6064
+============================================================
+```
+
 # 自评打分
 python student_kit/train_lora.py \
   --model_dir ./gemma3-270m \
