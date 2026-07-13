@@ -7,71 +7,54 @@
     训练集train.jsonl共 219 条对话样本，验证集valid.jsonl共 17 条对话样本；
     单条样本格式统一为 system 系统指令 + 用户图文 prompt + 标准 SVG 输出三段式对话。
 
-二、奖励函数（reward.py）设计与迭代说明
-### 2.1 程序化 SVG 奖励函数设计
+---
 
-本次基于基线`reward.py`扩展多维度可解释打分函数，作为 LoRA 微调的训练代理指标。函数采用分层加权打分逻辑，总分值域 \[0,1\]，包含 8 个独立评估维度，优先保障 SVG 语法合法性与提示词匹配度两大核心目标。
+## 二、奖励函数设计与实现
 
-1. 基础合法性层（valid_structure、smoothness、clean_extraction）：过滤无 SVG、标签残缺、多余文本等完全失效输出，是模型生成的最低门槛；
-2. 视觉规范层（length、palette、coordinates、element_diversity）：从长度、配色、画布坐标、图形多样性约束 Logo 视觉合理性，惩罚杂乱、越界、单一元素的劣质输出；
-3. 任务对齐层（prompt_coverage，最高权重 0.22）：衡量生成 SVG 与输入提示词的匹配程度，直接反映模型理解指令的泛化能力。
-所有子项加权聚合得到综合奖励，同时输出完整诊断信息，用于验证集基座与微调模型的量化对比，同时可观测训练过程中的过拟合、输出退化等问题。打分完全基于文本正则解析，无需图像渲染，训练与自评阶段计算开销极低，满足小模型快速迭代需求。
+### 2.1 设计目标
+
+为 Tiny LLM 设计一个 **廉价、可复现、可解释** 的训练代理指标，要求其：
+
+- 对常见失效模式敏感：无 SVG、截断、重复生成、提示词漂移；
+- 避免过度拟合表面标记：分数应反映结构合法性、视觉合理度与提示词对齐程度；
+- 便于在实验报告中解释：每个子维度都具备清晰的设计动机与可观测指标。
 
 ### 2.2 评分维度与权重
 
+综合奖励采用分层加权策略，总分取值范围为 `[0, 1]`，共包含 8 个独立子维度：
+
 | 维度 | 权重 | 设计理由 |
 |------|------|----------|
-| valid_structure | 0.18 | 结构有效性是最基本要求：viewBox 存在 + SVG 可被正则提取 |
-| prompt_coverage | 0.22 | 关键词覆盖度是保真度的低成本代理指标，权重最高 |
-| palette | 0.10 | 限制颜色数量防止模型生成混乱的霓虹色板 |
-| coordinates | 0.10 | 坐标越界/极度偏离中心表明采样不稳定 |
-| length | 0.10 | 过短 = 退化输出；过长 = 重复/截断 |
-| smoothness | 0.10 | 标签平衡和截断检测防止模型陷入重复生成 |
-| clean_extraction | 0.10 | 确保输出是干净的单 SVG，无 markdown 包裹或多余文本 |
-| element_diversity | 0.10 | 鼓励使用多种图元，避免单形状退化 |
+| `valid_structure` | 0.18 | 结构有效性是最低要求：要求存在 `viewBox` 与 `xmlns` |
+| `prompt_coverage` | 0.22 | 关键词覆盖度是保真度的低成本代理，权重最高 |
+| `palette` | 0.10 | 限制颜色数量，防止模型生成混乱的霓虹色板 |
+| `coordinates` | 0.10 | 坐标越界/极度偏离中心表明采样不稳定 |
+| `length` | 0.10 | 过短代表退化输出；过长代表重复或截断 |
+| `smoothness` | 0.10 | 标签开闭平衡与截断检测，防止重复生成 |
+| `clean_extraction` | 0.10 | 确保输出是干净的单 SVG，无 markdown 包裹或多余文本 |
+| `element_diversity` | 0.10 | 鼓励使用多种图元，避免单形状退化 |
 
-### 2.3 关键实现细节
+### 2.3 核心实现逻辑
 
-- **兜底正则提取**：当 XML 解析失败时，使用正则 `<svg\b[^>]*>.*?</svg>` 提取第一个 SVG 片段，避免无完整 SVG 时全部归零；
-- **关键词覆盖**：从 prompt 中抽取 top-10 内容词，在 SVG 文本空间中做 token 级匹配；
-- **平滑度/截断检测**：通过开放标签数与闭合标签数之比，检测重复生成或截断；
-- **坐标中心约束**：对 x/y/cx/cy/r/width/height 做中心框打分，惩罚极端越界。
+奖励函数整体可分为四大处理阶段：
 
-三、训练配置与实现（train_lora.py）
-3.1 模型与 LoRA 超参数
-基座模型：Gemma3-270M
-LoRA 配置：r=8，lora_alpha=16，dropout=0.05，目标模块 q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj；
-量化类型：NF4（bitsandbytes）
-bf16：True
-优化器：paged_adamw_8bit
-3.2 训练超参数
+1. **文本提取与清洗**：首先去除 markdown 代码块包裹，随后通过正则 `<svg\b[^>]*>.*?</svg>` 提取第一个顶层 SVG 片段；若无完整 SVG，直接返回 0 分。该阶段同时记录是否存在前后多余文本、是否含有代码 fences 等诊断信息。
+2. **结构合法性校验**：校验 SVG 是否同时具备 `viewBox` 与 `xmlns` 两个根属性，不满足则 `valid_structure = 0`。
+3. **多维度打分**：
+   - **长度**：低于 120 字符按比例扣分，高于 4000 字符也按比例扣分；
+   - **配色**：统计 `fill` / `stroke` / `stop-color` 中的合法十六进制颜色数量，超过 12 种或存在非法格式则扣分；
+   - **坐标**：对 `x/y/cx/cy/r/width/height` 等属性做范围与中心框联合评分，坐标绝对值超过 260 或明显偏离中心区域均会扣分；
+   - **提示词覆盖**：从 prompt 中抽取 top-10 内容关键词，在 SVG 文本空间做 token 级匹配；
+   - **图元多样性**：统计 `path/circle/ellipse/rect/polygon/line/g/defs` 等标签类型数量，种类越多得分越高；
+   - **平滑度**：通过开放标签数与闭合标签数之比判断截断或重复生成。
+4. **综合聚合**：将 8 个维度按权重线性加权，并裁剪至 `[0, 1]` 区间，同时返回子分数与诊断详情，供训练监控与实验分析使用。
 
-| 参数 | 值 |
-|------|-----|
-| max_seq_length | 768 |
-| per_device_train_batch_size | 2 |
-| gradient_accumulation_steps | 8 |
-| 总有效 batch size | 16 |
-| max_steps | 2000 |
-| learning_rate | 2e-4 |
-| warmup_steps | 100 |
-| weight_decay | 0.01 |
-| lr_scheduler | cosine |
-| gradient_checkpointing | False |
-| 早停策略 | 验证 loss 监控，patience=5 |
+### 2.4 关键特性
 
-3.3 核心数据处理逻辑（仅 SVG 计算损失）
-每条对话拼接完整文本：system 内容 + user 提示词 + assistant 标准 SVG；
-训练时将 system、user 所有 token 的 label 统一赋值 -100，损失函数自动忽略，仅末尾 SVG 片段参与交叉熵损失计算，严格贴合作业「仅监督 SVG 输出」的硬性要求。
+- **纯文本正则解析**：整个打分过程无需图像渲染，训练与评测阶段计算开销极低；
+- **兜底容错机制**：即使 XML 解析失败，仍可通过正则捕获有效 SVG 片段，避免全部样本归零；
+- **可解释性强**：每个子分数独立记录，便于定位模型失效模式与 reward 偏差来源。
 
-3.4 训练过程遇到的问题与折中方案
-初期 loss 恒为 0、梯度 NaN
-成因：单条样本 prompt 文本过长，SVG 片段极短，max_length 截断后有效 SVG token 被全部覆盖，无监督信号；
-修复：重写 token 分段截取逻辑，区分 padding 与真实 SVG 文本，保留图形片段梯度计算。
-硬件限制无法运行 DPO 强化学习
-V100 显卡算力版本不支持高版本 CUDA，无法搭建奖励导向 DPO 训练；
-折中方案：采用标准掩码 SFT 完成微调，训练后离线使用自研 reward 批量打分对比基座、LoRA，符合作业自评要求。
-模型 lm_head 权重缺失警告：仅日志提示，不影响训练、推理，可直接忽略。
 
 四、自评实验结果（eval_self.py）
 4.1 评测流程说明
@@ -231,7 +214,7 @@ smoothness                   0.6471     0.0407    -0.6064
 ============================================================
 ```
 
-# 自评打分
+# train_lora.py 训练输出
 python student_kit/train_lora.py \
   --model_dir ./gemma3-270m \
   --train_file ./dataset/logo-detailed-prompt/train.jsonl \
@@ -409,6 +392,7 @@ ALL DONE!
 ➜  svg_logo_task git:(master) ✗ pyenv shell 3.11.1
 ➜  svg_logo_task git:(master) ✗ 
 
+# eval_self.py 评分输出
 实验结果：
 
 ➜  svg_logo_task git:(master) ✗ python student_kit/eval_self.py \
