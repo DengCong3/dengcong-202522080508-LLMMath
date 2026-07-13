@@ -1,11 +1,25 @@
-一、项目任务概述
-本项目完成 Gemma3-270M 轻量模型 LoRA 微调 SVG 徽标生成任务，以作业 PartB 两大核心要求开展实验：
-自主设计、迭代优化多维度程序化reward.py代理打分函数，覆盖 SVG 语法、结构、退化、语义四大评分维度，作为 SFT 微调的优化代理指标；针对 XML 解析失败场景新增兜底正则打分逻辑，解决模型无完整 SVG 时全部归零无法对比的问题；
-基于train.jsonl执行 Prompt 掩码监督微调，仅对 SVG 片段计算交叉熵损失；使用独立eval_self.py脚本在valid.jsonl验证集上同时推理原始基座、LoRA 微调模型，量化两组模型打分均值，分析微调增益、代理指标 Goodhart 偏差、小模型生成能力限制。
-硬件环境：CloudStudio-Ubuntu 应用 Tesla V100-SXM2-32GB，Python3.11，原生 transformers+PEFT 实现 LoRA 训练，未采用 ms-swift 工具链（yaml解析失败）；
-数据集：
-    训练集train.jsonl共 219 条对话样本，验证集valid.jsonl共 17 条对话样本；
-    单条样本格式统一为 system 系统指令 + 用户图文 prompt + 标准 SVG 输出三段式对话。
+## 一、项目任务概述
+
+本项目基于 **Gemma3-270M** 轻量模型完成 LoRA 微调 SVG 徽标生成实验，严格按照作业 PartB 两项核心要求开展完整实验流程，核心工作分为三部分：
+
+1. **自定义奖励代理函数**
+自主设计并迭代优化多维度程序化 `reward.py` 打分代理，覆盖 SVG 语法、结构、退化、语义四大评分维度，作为 SFT 监督微调的优化代理指标；针对 XML 解析失败场景新增兜底正则打分逻辑，解决模型输出无完整 SVG 时分数直接归零、样本间无法横向对比的缺陷。
+2. **掩码式监督微调训练**
+基于 `train.jsonl` 训练集执行 Prompt 掩码监督微调，训练过程仅对 SVG 输出片段计算交叉熵损失，减少无关文本梯度干扰。
+3. **双模型对照评估**
+独立编写 `eval_self.py` 评估脚本，在 `valid.jsonl` 验证集上同步推理原始基座模型与 LoRA 微调后模型；量化两组模型奖励分数均值，用于分析微调增益、代理指标存在的 Goodhart 偏差以及小模型图像生成能力固有局限。
+
+### 实验环境说明
+
+- 硬件：CloudStudio-Ubuntu，Tesla V100-SXM2-32GB 显存
+- 软件栈：Python 3.11，原生 `transformers + PEFT` 完成 LoRA 训练；因 yaml 解析报错，未使用 ms-swift 工具链
+
+### 数据集配置
+
+数据集统一采用三段式对话结构：`system系统指令 + 用户图文prompt + 标准SVG输出`
+
+- 训练集 `train.jsonl`：219 条对话样本
+- 验证集 `valid.jsonl`：17 条对话样本
 
 ---
 
